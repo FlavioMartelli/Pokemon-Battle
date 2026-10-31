@@ -30,7 +30,8 @@ def get_models():
             l2_regularization=1.0, random_state=SEED),
     }
     try:
-        from xgboost import XGBClassifier
+        from importlib import import_module
+        XGBClassifier = import_module("xgboost").XGBClassifier
         models["xgboost"] = XGBClassifier(
             n_estimators=800, learning_rate=0.02, max_depth=4, subsample=0.8, colsample_bytree=0.6,
             min_child_weight=5, reg_lambda=2.0, n_jobs=-1, random_state=SEED, eval_metric="logloss")
