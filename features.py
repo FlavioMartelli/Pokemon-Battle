@@ -16,6 +16,7 @@ from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 
+# Constants and basic features for the building of the next ones
 STATS = ["base_hp", "base_atk", "base_def", "base_spa", "base_spd", "base_spe"]
 BAD_STATUS = ["slp", "par", "tox", "psn", "frz", "brn"]
 EFFECTS = ["substitute", "leechseed", "confusion", "trapped", "perish"]
@@ -23,17 +24,23 @@ KEY_MOVES = ["spikes", "rapidspin", "explosion", "selfdestruct", "curse", "belly
              "growth", "rest", "sleeptalk", "sleeppowder", "lovelykiss", "hypnosis", "spore",
              "thunderwave", "toxic", "roar", "whirlwind"]
 BOOST_STATS = ["atk", "def", "spa", "spd", "spe"]
-CHECKPOINTS = [10, 20, 30]
+CHECKPOINTS = [10, 20, 30] # Turns at which we change batch for comparing
 LOW_HP = 0.25
+
 # Moveset learning: keep moves a species uses in at least this share of its battles.
 MOVESET_MIN_FRAC = 0.1
+
 # p2 team completion: only trust a known full team that was seen this often and makes up
 # this share of all known teams containing the revealed Pokemon (~94% precision when 5 are revealed).
 TEAM_MIN_COUNT = 3
 TEAM_MIN_SHARE = 0.8
 MAX_KO_TURNS = 10.0
+
+
 # Species seen in at least this many battles get their own "HP at turn 30" feature per side.
 SPECIES_MIN_BATTLES = 300
+
+# Classes of utility moves that will be counted per side
 UTILITY_MOVES = {
     "explosion": {"explosion", "selfdestruct"},
     "rest": {"rest"},
@@ -47,21 +54,19 @@ def load_jsonl(path):
     with open(path) as f:
         return [json.loads(line) for line in f]
 
-
+# Loading of the type advantages chart given in input for later accounting of type matchups
 def load_type_chart(path):
     chart = defaultdict(lambda: 1.0)
     for row in pd.read_csv(path).itertuples(index=False):
         chart[(row.attacking_type, row.defending_type)] = float(row.multiplier)
     return chart
 
-
+# Helper to compute the multiplier given by the boost stage
 def boost_mult(stage):
-    """Stat multiplier for a boost stage (-6..+6): +1 = x1.5, +2 = x2, ..., -1 = x0.67, ..."""
     return (2 + stage) / 2 if stage >= 0 else 2 / (2 - stage)
 
-
+# Helper used on both train and test data to have in a single place all the stats and types of the pokemon we could see
 def build_pokedex(battles):
-    """Name -> {types, base stats} from every Pokemon whose stats we see (p1 teams, p2 leads)."""
     dex = {}
     for b in battles:
         for p in b["p1_team_details"] + [b["p2_lead_details"]]:
@@ -71,18 +76,16 @@ def build_pokedex(battles):
     dex["__unknown__"] = {"types": [], **mean}
     return dex
 
-
+# Gets us the names of all the pokemon used by p2 during a battle
 def revealed_p2(b):
     return list(dict.fromkeys(t["p2_pokemon_state"]["name"] for t in b["battle_timeline"]))
 
-
+# Gets how ofter a team of 6 is used by p2
 def build_p2_team_index(battles):
-    """How often each fully revealed p2 team (all 6 seen) occurs. Uses no labels."""
     return Counter(frozenset(r) for r in map(revealed_p2, battles) if len(r) == 6)
 
-
+# Tries to get what kind of moves a pokemon usually has
 def build_movesets(battles):
-    """Species -> details of the moves it commonly uses, learned from every timeline (no labels)."""
     counts, appearances, details = defaultdict(Counter), Counter(), {}
     for b in battles:
         used = defaultdict(set)
@@ -98,19 +101,17 @@ def build_movesets(battles):
     return {name: [details[m] for m, c in counts[name].items() if c >= MOVESET_MIN_FRAC * appearances[name]]
             for name in counts}
 
-
+# Identifies the common species of pokemon that usually appear in the battles to find who are the most relevant ones
 def build_common_species(battles):
-    """Species on a p1 team or revealed for p2 in at least SPECIES_MIN_BATTLES battles."""
     counts = Counter(n for b in battles for n in {p["name"] for p in b["p1_team_details"]} | set(revealed_p2(b)))
     return sorted(n for n, c in counts.items() if c >= SPECIES_MIN_BATTLES)
 
-
+# Tries to get assuming a best scenario of perfect DVs and max stat experience
 def stat_value(base, level, hp=False):
-    """Gen 2 stat with max DVs (15) and max stat experience (+64), as random-battle sets use."""
     core = (2 * base + 30 + 64) * level // 100
     return core + level + 10 if hp else core + 5
 
-
+# Initialization of the class that will be used to create the features
 class FeatureBuilder:
     def __init__(self, dex, chart, p2_teams=None, movesets=None, species=None):
         self.dex = dex
@@ -121,21 +122,25 @@ class FeatureBuilder:
         self._best_hit = {}
         self._completed = {}
 
+    # Gets teh informations about a pokemon giving its name
     def info(self, name):
         return self.dex.get(name, self.dex["__unknown__"])
 
+    # Gets how effective a move is giving the typing of the move and the defender's types
     def eff(self, move_type, defender_types):
         m = 1.0
         for t in defender_types:
             m *= self.chart[(move_type, t)]
         return m
 
+    # Calculates what is the best STAB multiplier agains given types of a defender
     def best_stab_eff(self, att_types, def_types):
-        """Best type multiplier an attacker gets on its own types against a defender."""
         if not att_types:
             return 1.0
         return max(self.eff(t, def_types) for t in att_types)
 
+    # Evaluates across all pairs of matchup pokemons between p1 and p2 who has teh advantage in the fight
+    # log2 is used to have a linear scaling and then the mean is taken
     def matchup(self, side_a, side_b):
         """Mean over (a, b) pairs of a's best STAB multiplier on b minus b's on a."""
         if not side_a or not side_b:
@@ -147,17 +152,13 @@ class FeatureBuilder:
         ]
         return float(np.mean(vals))
 
+    # Evaluates if a given pokemon is a special or physical attacker looking at its base stats
     def offensive_stat(self, name):
-        """The attacking stat a Pokemon mainly relies on: 'atk' or 'spa'."""
         i = self.info(name)
         return "atk" if i["base_atk"] >= i["base_spa"] else "spa"
 
+    # Evaluates how much damage a move does giving in input the attacker, the defender, the move and all the possible boosts including STAB
     def move_damage(self, move, attacker, defender, att_boosts, def_boosts):
-        """Rough damage estimate: power * STAB * effectiveness * boosted attack/defense ratio * accuracy.
-
-        Boosts are the ones recorded at the end of the turn, so a boost gained this turn is
-        already counted; close enough for a summary feature.
-        """
         if not move or move["base_power"] == 0 or move["category"] == "status":
             return 0.0, 1.0
         a, d = self.info(attacker), self.info(defender)
@@ -169,6 +170,8 @@ class FeatureBuilder:
         e = self.eff(move["type"], d["types"])
         return move["base_power"] * stab * e * ratio * move["accuracy"], e
 
+    # Tries to infer p2's full team. If it is already known, it returns it, otherwise it checks if it can be relibly inferred from
+    # the common teams that are known
     def complete_p2(self, revealed):
         """p2's full team if the revealed Pokemon match one known team confidently, else None."""
         r = frozenset(revealed)
@@ -182,8 +185,8 @@ class FeatureBuilder:
             self._completed[r] = top if ok else None
         return self._completed[r]
 
+    # Evaluates the expected damage as a fraction of the defender's max hp
     def hit_pct(self, move, attacker, defender, att_level, def_level):
-        """Share of the defender's max HP one hit takes (Gen 2 formula, average roll, no crits)."""
         a, d = self.info(attacker), self.info(defender)
         atk, dfn = ("base_atk", "base_def") if move["category"] == "physical" else ("base_spa", "base_spd")
         dmg = (2 * att_level / 5 + 2) * move["base_power"] * stat_value(a[atk], att_level)
@@ -191,8 +194,8 @@ class FeatureBuilder:
         dmg *= (1.5 if move["type"] in a["types"] else 1.0) * self.eff(move["type"], d["types"])
         return dmg * 0.92 * move["accuracy"] / stat_value(d["base_hp"], def_level, hp=True)
 
+    # Evaluates what the best possible hit from an attacker would be from the given moveset, if not known, a generic 80 pwr STAB is assumed
     def best_hit(self, attacker, defender, att_level, def_level):
-        """Best expected hit from the attacker's learned moveset (a generic 80-power STAB move if unknown)."""
         key = (attacker, defender, att_level, def_level)
         if key not in self._best_hit:
             moves = [m for m in self.movesets.get(attacker, [])
@@ -204,8 +207,8 @@ class FeatureBuilder:
             self._best_hit[key] = max(self.hit_pct(m, attacker, defender, att_level, def_level) for m in moves)
         return self._best_hit[key]
 
+    # Evaluates how many hits an attacker would need to KO each defender, assuming the attacker always does its best hit
     def threat_features(self, f, side, attackers, defenders, def_hp, att_levels, def_levels):
-        """How many hits the attackers' best answer needs to KO each surviving defender."""
         if not defenders:
             turns = [0.0]
         elif not attackers:
@@ -219,25 +222,27 @@ class FeatureBuilder:
         f[f"{side}_ko_turns_max"] = max(turns)
         f[f"{side}_n_one_hit_ko"] = sum(t <= 1 for t in turns) if defenders else 0
 
+    # Counts, giving all the alive pokemons, how many utility moves are left and of which type
     def utility_counts(self, f, side, alive):
         for k, moves in UTILITY_MOVES.items():
             f[f"{side}_alive_{k}"] = sum(any(m["name"] in moves for m in self.movesets.get(n, [])) for n in alive)
 
     def team_keys(self, b):
-        """(p1 team, p2 team or None) identifiers used for team win-rate encoding in train.py."""
         return frozenset(p["name"] for p in b["p1_team_details"]), self.complete_p2(revealed_p2(b))
 
+    # Function that will build all the features, given a single battle and return them all in a dictionary
     def build(self, b):
+
         f = {}
         team1 = b["p1_team_details"]
         tl = b["battle_timeline"]
         names1 = [p["name"] for p in team1]
 
         # ---- static team features -------------------------------------------------
+
         p1_stats = np.array([[p[k] for k in STATS] for p in team1], dtype=float)
         p2_names = revealed_p2(b)
         completed = self.complete_p2(p2_names)
-        # Revealed Pokemon first, then any confidently inferred unseen ones.
         p2_team = p2_names + sorted(set(completed) - set(p2_names)) if completed else p2_names
         p2_stats = np.array([[self.info(n)[k] for k in STATS] for n in p2_team], dtype=float)
         p1_mean, p2_mean = p1_stats.mean(0), p2_stats.mean(0)
@@ -259,6 +264,7 @@ class FeatureBuilder:
         f["lead_matchup"] = self.matchup([tl[0]["p1_pokemon_state"]["name"]], [lead2])
 
         # ---- walk the timeline ----------------------------------------------------
+
         hp1 = {n: 1.0 for n in names1}
         hp2 = {}
         status1, status2 = {}, {}
@@ -271,20 +277,19 @@ class FeatureBuilder:
         snap = {}
         mv = defaultdict(float)
         last_ko1 = last_ko2 = 0
-        # Spikes on each side of the field (Gen 2: one layer, removed by the victim's Rapid Spin).
         spikes_on = {"p1": False, "p2": False}
         rested = {"p1": set(), "p2": set()}
         max_boost = {"p1": 0, "p2": 0}
         max_off_boost = {"p1": 0, "p2": 0}
 
         for t in tl:
+
             turn = t["turn"]
             batch = min((turn - 1) * len(CHECKPOINTS) // 30, len(CHECKPOINTS) - 1)
             s1, s2 = t["p1_pokemon_state"], t["p2_pokemon_state"]
             m1, m2 = t["p1_move_details"], t["p2_move_details"]
             n1, n2 = s1["name"], s2["name"]
 
-            # Damage = HP lost since we last saw that Pokemon (positive), heals are ignored.
             dmg_taken[batch] += max(hp1.get(n1, 1.0) - s1["hp_pct"], 0.0)
             dmg_dealt[batch] += max(hp2.get(n2, 1.0) - s2["hp_pct"], 0.0)
             hp1[n1], hp2[n2] = s1["hp_pct"], s2["hp_pct"]
@@ -294,7 +299,7 @@ class FeatureBuilder:
             if s2["status"] == "fnt" and n2 not in fainted2:
                 fainted2.add(n2); ko_by_batch2[batch] += 1; last_ko2 = turn
 
-            # Null move: a switch if the active Pokemon changed, otherwise it could not act.
+            # Null move: a switch if the active Pokemon changed, otherwise it flinched or something similar.
             for side, other, m, s, prev in (("p1", "p2", m1, s1, prev_active1),
                                             ("p2", "p1", m2, s2, prev_active2)):
                 n = s["name"]
@@ -334,12 +339,13 @@ class FeatureBuilder:
             prev_active1, prev_active2 = n1, n2
 
             if turn in CHECKPOINTS:
-                # Unseen p2 Pokemon assumed at full HP (6 per team).
+                # Unseen p2 Pokemon are obviously assumed to be at full hp
                 hp_left1 = sum(hp1.values())
                 hp_left2 = sum(hp2.values()) + (6 - len(hp2))
                 snap[turn] = (hp_left1, hp_left2, len(fainted1), len(fainted2))
 
         # ---- state at the last checkpoint + trends ---------------------------------
+
         for c in CHECKPOINTS:
             h1, h2, k1, k2 = snap[c]
             f[f"hp_diff_t{c}"] = h1 - h2
@@ -358,7 +364,7 @@ class FeatureBuilder:
         f["last_ko_by_p1"] = int(last_ko2 > last_ko1)
 
         alive1 = [n for n in names1 if n not in fainted1]
-        # alive2 includes inferred unseen teammates (full HP); hp2 only has the revealed ones.
+        # alive2 includes inferred unseen pokemons while hp2 only has the revealed ones.
         alive2 = [n for n in p2_team if n not in fainted2]
         f["p1_alive"] = len(alive1)
         f["p2_alive_seen"] = sum(n not in fainted2 for n in p2_names)
@@ -369,7 +375,6 @@ class FeatureBuilder:
         f["p2_alive_hp_mean"] = np.mean([hp2.get(n, 1.0) for n in alive2]) if alive2 else 0.0
         f["type_matchup_alive"] = self.matchup(alive1, alive2)
 
-        # Threats: hits needed by each side's survivors to KO the other side's survivors.
         levels1 = {p["name"]: p["level"] for p in team1}
         levels2 = defaultdict(lambda: 100, {b["p2_lead_details"]["name"]: b["p2_lead_details"]["level"]})
         self.threat_features(f, "p1", alive1, alive2, hp2, levels1, levels2)
@@ -401,8 +406,7 @@ class FeatureBuilder:
         f["p1_active_boosts"] = sum(a1["boosts"].values())
         f["p2_active_boosts"] = sum(a2["boosts"].values())
         f["active_boost_diff"] = f["p1_active_boosts"] - f["p2_active_boosts"]
-        # Per-stat boosts, plus the boost on the stat each active Pokemon actually attacks with
-        # and the average of its two defensive boosts.
+        # Per-stat boosts, plus the boost on the stat each active Pokemon actually attacks with and the average of the two defenses boosts
         for side, a in (("p1", a1), ("p2", a2)):
             for st in BOOST_STATS:
                 f[f"{side}_boost_{st}"] = a["boosts"][st]
@@ -411,14 +415,12 @@ class FeatureBuilder:
         f["off_boost_diff"] = f["p1_off_boost"] - f["p2_off_boost"]
         f["def_boost_diff"] = f["p1_def_boost"] - f["p2_def_boost"]
         f["spe_boost_diff"] = f["p1_boost_spe"] - f["p2_boost_spe"]
-        # Speed after boosts decides who moves first in the active matchup.
         f["active_eff_speed_diff"] = (self.info(a1["name"])["base_spe"] * boost_mult(a1["boosts"]["spe"])
                                       - self.info(a2["name"])["base_spe"] * boost_mult(a2["boosts"]["spe"]))
         for e in EFFECTS:
             f[f"p1_eff_{e}"] = int(e in a1["effects"])
             f[f"p2_eff_{e}"] = int(e in a2["effects"])
 
-        # Move usage.
         for side in ("p1", "p2"):
             for k in ("switches", "cant_move", "physical_moves", "special_moves", "status_moves",
                       "priority_moves", "est_dmg", "super_eff"):
@@ -446,7 +448,6 @@ class FeatureBuilder:
 
 
 def make_features(train, test, type_chart_path, return_keys=False):
-    """Feature tables for train and test. With return_keys, also each battle's team keys."""
     battles = train + test
     fb = FeatureBuilder(build_pokedex(battles), load_type_chart(type_chart_path),
                         build_p2_team_index(battles), build_movesets(battles), build_common_species(battles))
