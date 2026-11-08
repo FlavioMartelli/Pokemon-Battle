@@ -1,9 +1,10 @@
-"""Randomized hyperparameter search for each base model; writes best_params.json for train.py.
+"""
+Randomized starting hyperparameters for each model, the best ones found are then written in best_params.json.
 
-Usage: python tune.py [n_iter]
+Usage: python tune.py [n_iter] (default n_iter = 30)
 
 Tuning uses a different CV split (seed 7) than the evaluation in train.py (seed 42),
-so train.py's scores are less optimistic than the search's own best scores.
+so train.py's scores are less optimistic.
 """
 import json
 import sys
@@ -16,9 +17,10 @@ from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
 from features import load_jsonl, make_features
 from train import get_models
 
-TUNE_SEED = 7
+tune_seed = 7
 
-SPACES = {
+# Hyperparameter search spaces for each model
+spaces = {
     "logreg": {
         "logisticregression__C": loguniform(1e-3, 3),
         "logisticregression__l1_ratio": uniform(0, 1),
@@ -54,39 +56,48 @@ SPACES = {
     },
 }
 
-
+# Convert numpy types to normal for the creation of the final json file
 def to_json(v):
     return v.item() if isinstance(v, np.generic) else v
 
 
 def main():
+
+    # Loading, extracting and setting for CV
     n_iter = int(sys.argv[1]) if len(sys.argv) > 1 else 30
     train = load_jsonl("train.jsonl")
     test = load_jsonl("test.jsonl")
     X, _ = make_features(train, test, "type_chart_gen2.csv")
     y = np.array([b["player_won"] for b in train])
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=TUNE_SEED)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=tune_seed)
 
-    # XGBoost is tuned on the CPU: on this small dataset 20 parallel CPU fits beat one GPU,
-    # which runs fits one at a time (benchmarked: 41s vs 57s for 20 fits on an RTX 3060).
+    # Retrieving models at their untuned baseline (made on cpu because on gpu was running slower than on cpu)
+    # and parallellized over search candidates rather than inside each model
     models = get_models(tuned=False, device="cpu", xgb_seeds=1)
     for name in ("random_forest", "extra_trees", "xgboost"):
-        if name in models:  # parallelise over search candidates instead of inside each model
+        if name in models:
             models[name].set_params(n_jobs=1)
+
 
     best = {}
     for name, model in models.items():
         t0 = time.time()
+
+        # Initizlized search on every model keeping track of accuracy and nll, refitting basing on nll and fitted on training data
         search = RandomizedSearchCV(
-            model, SPACES[name], n_iter=n_iter, cv=cv, n_jobs=-1, random_state=TUNE_SEED,
+            model, spaces[name], n_iter=n_iter, cv=cv, n_jobs=-1, random_state=tune_seed,
             scoring={"logloss": "neg_log_loss", "acc": "accuracy"}, refit="logloss")
         search.fit(X, y)
+
+        # Gets the best index and accuracy for that model, then
+        # saves its hyerparameters in the dictionary made before cleaning the numpy types
         i = search.best_index_
         acc = search.cv_results_["mean_test_acc"][i]
         best[name] = {k: to_json(v) for k, v in search.best_params_.items()}
         print(f"{name:15s} logloss {-search.best_score_:.4f} acc {acc:.4f} "
               f"({time.time() - t0:.0f}s) {best[name]}", flush=True)
 
+    # Creation of the final json file
     with open("best_params.json", "w") as f:
         json.dump(best, f, indent=2)
     print("Wrote best_params.json")
