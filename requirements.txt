@@ -1,0 +1,9 @@
+# Tested with Python 3.13 and: numpy 2.5.0, pandas 3.0.3, scipy 1.18.0, scikit-learn 1.9.0, xgboost 3.4.1
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+# 1.8+ needed: the tuned logistic regression uses l1_ratio without penalty="elasticnet",
+# which older versions ignore.
+scikit-learn>=1.8
+# 2.0+ needed for the device="cuda"/"cpu" parameter. The PyPI wheel includes GPU support.
+xgboost>=2.0
